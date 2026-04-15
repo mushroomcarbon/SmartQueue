@@ -1,6 +1,6 @@
 # SmartQueue
 
-**Office hours, minus the chaos.**
+**De-shittified Office Hours!**
 
 SmartQueue is a queue management system designed to make university office hours less painful for students and TAs. We built it as a semester-long project at the University of Toronto, going through a full user-centered design process from background research and personas all the way through to a high-fidelity prototype and summative usability evaluation.
 
