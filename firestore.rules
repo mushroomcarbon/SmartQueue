@@ -1,98 +1,80 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    
-    // ===============================================================
-    // Assumed Data Model
-    // ===============================================================
-    //
-    // Collection: sessions
-    // Fields:
-    //   - course: string (required)
-    //   - title: string (required)
-    //   - time: string (required)
-    //   - location: string (required)
-    //   - host: string (required)
-    //   - avgMin: number (required)
-    //   - tags: list (required)
-    //
-    // Collection: sessions/{sessionId}/tickets
-    // Fields:
-    //   - topic: string (required, max 50)
-    //   - assignment: string (required, max 50)
-    //   - summary: string (required, max 500)
-    //   - helpType: string (required, enum: ['Quick Check', 'Deep Dive'])
-    //   - uid: string (required, immutable)
-    //   - createdAt: timestamp (required, immutable)
-    //   - status: string (required, enum: ['active', 'resolved', 'archived'])
-    //   - taExplanation: string (optional, max 1000)
-    //
-    // ===============================================================
 
-    // ===============================================================
-    // Helper Functions
-    // ===============================================================
+    // ─── Helper Functions ──────────────────────────────────────────
     
-    function isAuthenticated() {
+    function isSignedIn() {
       return request.auth != null;
     }
-
-    function isAdmin() {
-      return isAuthenticated() &&
-        (request.auth.token.email == "andrew01px2021@gmail.com" ||
-         request.auth.token.email == "admin@university.edu" ||
-         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'));
+    
+    function getUserProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    function isTA() {
+      return isSignedIn() && getUserProfile().role == 'ta';
+    }
+    
+    function sameSchool(schoolId) {
+      return isSignedIn() && getUserProfile().schoolId == schoolId;
     }
 
-    function isOwner(uid) {
-      return isAuthenticated() && request.auth.uid == uid;
-    }
-
-    function isValidSession(data) {
-      return data.keys().hasAll(['course', 'title', 'time', 'location', 'host', 'avgMin', 'tags']) &&
-             data.course is string && data.course.size() > 0 && data.course.size() < 20 &&
-             data.title is string && data.title.size() > 0 && data.title.size() < 100 &&
-             data.time is string && data.time.size() > 0 && data.time.size() < 100 &&
-             data.location is string && data.location.size() > 0 && data.location.size() < 100 &&
-             data.host is string && data.host.size() > 0 && data.host.size() < 100 &&
-             data.avgMin is number && data.avgMin >= 0 &&
-             data.tags is list;
-    }
-
-    function isValidTicket(data) {
-      return data.keys().hasAll(['topic', 'assignment', 'summary', 'helpType', 'uid', 'createdAt', 'status']) &&
-             data.topic is string && data.topic.size() > 0 && data.topic.size() <= 50 &&
-             data.assignment is string && data.assignment.size() > 0 && data.assignment.size() <= 50 &&
-             data.summary is string && data.summary.size() > 0 && data.summary.size() <= 500 &&
-             data.helpType in ['Quick Check', 'Deep Dive'] &&
-             data.uid is string && data.uid == request.auth.uid &&
-             data.createdAt is timestamp &&
-             data.status in ['active', 'resolved', 'archived'];
-    }
-
-    // ===============================================================
-    // Rules
-    // ===============================================================
-
+    // ─── Users Collection ────────────────────────────────────────
+    // Users can read their own profile. 
+    // Users can create their own profile on registration.
+    // No one can modify another user's profile.
+    
     match /users/{userId} {
-      allow read: if isAuthenticated();
-      allow write: if isOwner(userId) && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']) || isAdmin());
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'schoolId'])
+        && request.resource.data.role in ['student', 'ta']
+        && request.resource.data.uid == userId;
+      allow update, delete: if false; // profiles are immutable for now
     }
 
-    match /sessions/{sessionId} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAdmin() && isValidSession(request.resource.data);
-      allow delete: if isAdmin();
+    // ─── Schools Collection ──────────────────────────────────────
+    // Anyone signed in can read a school (needed to validate school ID on registration).
+    // Only TAs can create schools.
+    
+    match /schools/{schoolId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update, delete: if false; // schools are immutable for now
+    }
 
+    // ─── Sessions Collection ─────────────────────────────────────
+    // Users can read sessions that belong to their school.
+    // Only TAs can create/update/delete sessions within their school.
+    
+    match /sessions/{sessionId} {
+      allow read: if isSignedIn() && sameSchool(resource.data.schoolId);
+      allow create: if isTA() && sameSchool(request.resource.data.schoolId);
+      allow update: if isTA() && sameSchool(resource.data.schoolId);
+      allow delete: if isTA() && sameSchool(resource.data.schoolId);
+
+      // ─── Tickets Sub-collection ──────────────────────────────
+      // Users in the same school can read tickets.
+      // Students can create tickets (with their own uid).
+      // TAs can update tickets (resolve, archive). Students can update their own.
+      // TAs can delete tickets. Students can delete their own.
+      
       match /tickets/{ticketId} {
-        allow read: if isAuthenticated();
-        allow create: if isAuthenticated() && isValidTicket(request.resource.data);
-        allow update: if isAuthenticated() && (
-          isAdmin() || 
-          (isOwner(resource.data.uid) && isValidTicket(request.resource.data) && request.resource.data.uid == resource.data.uid && request.resource.data.createdAt == resource.data.createdAt) ||
-          (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['taExplanation']))
+        allow read: if isSignedIn() && sameSchool(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data.schoolId
         );
-        allow delete: if isOwner(resource.data.uid) || isAdmin();
+        allow create: if isSignedIn() && sameSchool(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data.schoolId
+        ) && request.resource.data.uid == request.auth.uid;
+        allow update: if isSignedIn() && sameSchool(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data.schoolId
+        ) && (isTA() || resource.data.uid == request.auth.uid);
+        allow delete: if isSignedIn() && sameSchool(
+          get(/databases/$(database)/documents/sessions/$(sessionId)).data.schoolId
+        ) && (isTA() || resource.data.uid == request.auth.uid);
       }
     }
   }
